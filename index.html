@@ -55,6 +55,7 @@
   <span>방위 <b id="stHeading">--</b></span>
   <span>걸음 <b id="stSteps">0</b></span>
   <span>이동 <b id="stDist">0.0</b> m</span>
+  <span>선가속도 <b id="stLin">0.00</b></span>
   <span id="stGyro" class="bad">자이로: 없음</span>
   <span id="stAccel" class="bad">가속도: 없음</span>
 </div>
@@ -63,6 +64,7 @@
   <button id="btnPause" class="secondary" disabled>일시정지</button>
   <button id="btnReset" class="secondary">처음부터</button>
   <button id="btnSim" class="secondary">시뮬레이션 모드</button>
+  <button id="btnTestStep" class="secondary">걸음 1회(테스트)</button>
   <label class="chk"><input type="checkbox" id="chkRaw"> 원시 위치 보기</label>
   <label class="chk"><input type="checkbox" id="chkMag" checked> 자계 보정</label>
   <span class="slider">걸음 길이 <input type="range" id="rngStep" min="0.4" max="0.9" step="0.05" value="0.7"><span id="rngStepVal">0.70</span> m</span>
@@ -160,7 +162,7 @@ let gyroBias = 0, lastGyroT = null, gyroBuf = [];
 let magHeading = null, magRef = null, headingAtRef = 0;
 let lastGyroEvent = 0, lastAccelEvent = 0;
 let lp = { x: 0, y: 0, z: 0 }, lpInit = false;
-let peak = null, lastStepT = 0;
+let stepState = 0, peak = 0, lastStepT = 0, linMag = 0, stepFlash = 0;
 let stillSince = null;
 
 function onGyro(rate, t) {
@@ -206,13 +208,18 @@ function onAccel(a, t) {
 }
 
 function detectStep(t, m) {
-  if (m < 0.4 || t - lastStepT < 300) { peak = null; return; }
-  if (peak == null) { peak = m; }
-  else if (m >= peak) { peak = m; }
-  else if (peak > 0.55 && m < 0.35) {
-    lastStepT = t;
-    peak = null;
-    doStep();
+  linMag = m;
+  if (t - lastStepT < 300) { stepState = 0; return; }
+  if (stepState === 0) {
+    if (m > 0.45) { stepState = 1; peak = m; }
+  } else {
+    if (m > peak) peak = m;
+    if (m < 0.25 && peak > 0.55) {
+      stepState = 0;
+      lastStepT = t;
+      doStep();
+      stepFlash = performance.now();
+    }
   }
 }
 
@@ -290,7 +297,7 @@ btnReset.onclick = () => {
   S.pos = { x: 24.5, y: 24.5 }; S.rawPos = { ...S.pos };
   S.heading = -Math.PI / 2;
   S.steps = 0; S.dist = 0; S.trail = [];
-  gyroBias = 0; stillSince = null; lastStepT = 0; peak = null;
+  gyroBias = 0; stillSince = null; lastStepT = 0; stepState = 0; peak = 0; linMag = 0;
   refreshUI();
 };
 btnSim.onclick = () => {
@@ -300,6 +307,7 @@ btnSim.onclick = () => {
   refreshUI();
 };
 rngStep.oninput = () => { $("rngStepVal").textContent = parseFloat(rngStep.value).toFixed(2); };
+$("btnTestStep").onclick = () => { if (S.mode === "tracking" || S.mode === "paused") doStep(); };
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden && S.mode === "tracking" && !S.sim) { S.mode = "paused"; refreshUI(); }
@@ -396,6 +404,16 @@ function draw() {
   $("stHeading").textContent = Math.round(norm(S.heading) * 180 / Math.PI) + "°";
   $("stSteps").textContent = S.steps;
   $("stDist").textContent = S.dist.toFixed(1);
+  $("stLin").textContent = linMag.toFixed(2);
+
+  if (performance.now() - stepFlash < 350) {
+    const pr = (performance.now() - stepFlash) / 350;
+    ctx.strokeStyle = "rgba(224,138,60," + (1 - pr) + ")";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ux, uy, 8 + pr * 22, 0, TAU);
+    ctx.stroke();
+  }
 
   requestAnimationFrame(draw);
 }
