@@ -177,13 +177,15 @@ let lp = { x: 0, y: 0, z: 0 }, lpInit = false;
 let stepState = 0, peak = 0, lastStepWall = 0, stepStuckSince = 0, linMag = 0, stepFlash = 0;
 let stillSince = null, lastEventT = 0;
 let lastVr = 0, peakVr = 0;
-const TRIG = 0.35, FIRE = 0.45, REC = 0.2, VMIN = 0.5; // VMIN = 수직 성분 최소 비율
-const diag = { ev: 0, tsBad: 0, steps: 0, ring: [] };
+const TRIG = 0.4, FIRE = 0.6, REC = 0.2, VMIN = 0.5; // VMIN = 수직 성분 최소 비율
+const diag = { ev: 0, tsBad: 0, steps: 0, nan: 0, ring: [] };
 let logBuf = [], lastLogT = 0, stepSinceLog = false;
+let stepEvents = []; // 걸음 감지 이벤트 상세 (t, peak, vr, head)
 
 function onGyro(rate) {
   const t = performance.now();
   lastGyroEvent = t;
+  if (typeof rate !== "number" || isNaN(rate)) { diag.nan++; return; }
   if (S.mode === "paused") return;
   if (lastGyroT == null || t < lastGyroT) { lastGyroT = t; return; }
   let dt = (t - lastGyroT) / 1000;
@@ -192,11 +194,13 @@ function onGyro(rate) {
   if (S.mode === "calibrating") {
     gyroBuf.push(rate);
   } else if (S.mode === "tracking" && !S.sim) {
-    S.heading = norm(S.heading + (rate - gyroBias) * dt);
-    if (chkMag.checked && magHeading != null && magRef != null) {
+    let nh = norm(S.heading + (rate - gyroBias) * dt);
+    if (chkMag.checked && magHeading != null && magRef != null && !isNaN(magHeading)) {
       const magMap = norm(magHeading - magRef + headingAtRef);
-      S.heading = norm(S.heading + 0.03 * wrapPI(magMap - S.heading));
+      nh = norm(nh + 0.03 * wrapPI(magMap - nh));
     }
+    S.heading = isNaN(nh) ? 0 : nh;
+    if (isNaN(nh)) diag.nan++;
     gyroBuf.push([t, rate]);
     while (gyroBuf.length && t - gyroBuf[0][0] > 1000) gyroBuf.shift();
     if (stillSince != null && t - stillSince > 1500 && gyroBuf.length > 20) {
@@ -256,6 +260,9 @@ function detectStep(t, m, vr) {
     stepState = 0;
     lastStepWall = t;
     diag.steps++;
+    stepEvents.push({ t: Math.round(t), peak: peak.toFixed(2), vr: peakVr.toFixed(2),
+      head: Math.round(norm(S.heading) * 180 / Math.PI) });
+    if (stepEvents.length > 200) stepEvents.shift();
     doStep();
     stepFlash = t;
     return true;
@@ -290,6 +297,7 @@ if (typeof DeviceOrientationEvent !== "undefined") {
       const o = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
       hDeg = (360 - e.alpha + o) % 360;
     }
+    if (typeof hDeg !== "number" || isNaN(hDeg)) { diag.nan++; return; }
     magHeading = hDeg * Math.PI / 180;
   });
 }
@@ -338,7 +346,8 @@ btnReset.onclick = () => {
   S.steps = 0; S.dist = 0; S.trail = [];
   gyroBias = 0; stillSince = null; lastStepWall = 0; stepStuckSince = 0; stepState = 0; peak = 0; linMag = 0; lastEventT = 0;
   lastVr = 0; peakVr = 0; logBuf.length = 0; lastLogT = 0; stepSinceLog = false;
-  diag.ev = 0; diag.tsBad = 0; diag.steps = 0; diag.ring.length = 0;
+  stepEvents.length = 0;
+  diag.ev = 0; diag.tsBad = 0; diag.steps = 0; diag.nan = 0; diag.ring.length = 0;
   $("logBox").style.display = "none";
   refreshUI();
 };
@@ -364,7 +373,13 @@ $("btnLog").onclick = async () => {
     r[4].toFixed(2), r[5].toFixed(2), r[6].toFixed(2), String(r[7]).padStart(4),
     r[8].toFixed(1), r[9].toFixed(1), r[10]
   ].join(" "));
-  const text = "t(ms)  ax  ay  az   lin  vAcc  vr  head   x    y   S\n" + lines.join("\n");
+  const evLines = stepEvents.filter(ev => ev.t >= start)
+    .map(ev => `t=${ev.t - start} peak=${ev.peak} vr=${ev.vr} head=${ev.head}`);
+  const text =
+    "t(ms)  ax  ay  az   lin  vAcc  vr  head   x    y   S\n" + lines.join("\n") +
+    "\n--- step events (감지 시점, peak=최대가속 vr=수직비율) ---\n" +
+    (evLines.length ? evLines.join("\n") : "(없음)") +
+    `\n--- diag: ev=${diag.ev} steps=${diag.steps} nan=${diag.nan} ---`;
   $("logBox").value = text;
   try {
     await navigator.clipboard.writeText(text);
@@ -497,6 +512,7 @@ function draw() {
     for (const q of diag.ring) if (q[1] > maxM) maxM = q[1];
     $("diagText").textContent =
       "이벤트: " + diag.ev + " | 최근 5초: " + (c / 5).toFixed(0) + "/s | m 최대(10초): " + maxM.toFixed(2) +
+      " | NaN: " + diag.nan +
        " | 걸음 감지: " + diag.steps + " | 감지 상태: " + stepState + " (피크 " + peak.toFixed(2) + " / 수직비율 " + lastVr.toFixed(2) + ")" +
       " | rawPos: (" + S.rawPos.x.toFixed(1) + ", " + S.rawPos.y.toFixed(1) + ") → pos: (" + S.pos.x.toFixed(1) + ", " + S.pos.y.toFixed(1) + ")" +
       " | 줌: " + view.zoom.toFixed(1) + "x";
