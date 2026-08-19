@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>실내 미니맵 프로토타입 (PDR)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #101418; color: #e6e6e6;
+    font-family: system-ui, "Malgun Gothic", sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 10px;
+  }
+  h1 { font-size: 16px; margin: 6px 0; font-weight: 600; }
+  #banner {
+    width: 100%; max-width: 700px; padding: 8px 10px; margin-bottom: 8px;
+    background: #1b2530; border: 1px solid #2c3e50; border-radius: 8px;
+    font-size: 14px; line-height: 1.4; min-height: 40px;
+  }
+  #banner.warn { background: #3a2a12; border-color: #7a5a1e; }
+  #map {
+    width: 100%; max-width: 700px; touch-action: none;
+    background: #161b21; border: 1px solid #2c3e50; border-radius: 8px;
+    cursor: crosshair;
+  }
+  #status {
+    width: 100%; max-width: 700px; display: flex; flex-wrap: wrap; gap: 6px 14px;
+    font-size: 13px; margin: 8px 0; font-variant-numeric: tabular-nums;
+  }
+  #status b { color: #7ec8ff; font-weight: 600; }
+  .ok { color: #6fd66f; } .bad { color: #8a8f98; }
+  #controls {
+    width: 100%; max-width: 700px; display: flex; flex-wrap: wrap;
+    gap: 8px; align-items: center;
+  }
+  button {
+    background: #2b6cb0; color: #fff; border: 0; border-radius: 8px;
+    padding: 10px 14px; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { background: #333c46; color: #777; cursor: default; }
+  button.secondary { background: #3a4756; }
+  label.chk { font-size: 13px; display: inline-flex; align-items: center; gap: 4px; }
+  .slider { font-size: 13px; display: inline-flex; align-items: center; gap: 6px; }
+  input[type=range] { width: 90px; }
+  #hint { width: 100%; max-width: 700px; font-size: 12px; color: #7a8694; margin-top: 8px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<h1>실내 미니맵 프로토타입 — PDR (보행 데드레컨닝)</h1>
+<div id="banner">준비 중…</div>
+<canvas id="map" width="800" height="600"></canvas>
+<div id="status">
+  <span>방위 <b id="stHeading">--</b></span>
+  <span>걸음 <b id="stSteps">0</b></span>
+  <span>이동 <b id="stDist">0.0</b> m</span>
+  <span id="stGyro" class="bad">자이로: 없음</span>
+  <span id="stAccel" class="bad">가속도: 없음</span>
+</div>
+<div id="controls">
+  <button id="btnStart">추적 시작</button>
+  <button id="btnPause" class="secondary" disabled>일시정지</button>
+  <button id="btnReset" class="secondary">처음부터</button>
+  <button id="btnSim" class="secondary">시뮬레이션 모드</button>
+  <label class="chk"><input type="checkbox" id="chkRaw"> 원시 위치 보기</label>
+  <label class="chk"><input type="checkbox" id="chkMag" checked> 자계 보정</label>
+  <span class="slider">걸음 길이 <input type="range" id="rngStep" min="0.4" max="0.9" step="0.05" value="0.7"><span id="rngStepVal">0.70</span> m</span>
+</div>
+<div id="hint">
+  사용: ① 위치 지정(지도 탭) → ② 방향 지정(지도 드래그) → ③ 추적 시작.<br>
+  실제 센서는 HTTPS 또는 localhost 환경에서만 동작합니다. 데스크톱에서 테스트하려면 시뮬레이션 모드를 켜고
+  <b>↑</b>=한 걸음, <b>←</b>/<b>→</b>=회전, <b>↓</b>=180° 전향 키를 사용하세요.<br>
+  위치는 지도의 통로에 스냅(map matching)됩니다. 화면을 잠그면 센서가 멈춥니다.
+</div>
+<script>
+"use strict";
+/* ---------------- 지도 정의 (1 셀 = 1m) ---------------- */
+const COLS = 40, ROWS = 30, SCALE = 20;
+const WALLS = [
+  [0,0,COLS,1], [0,ROWS-1,COLS,1], [0,0,1,ROWS], [COLS-1,0,1,ROWS], // 외벽
+  [5,10,16,1],   // A: x5..20, y10
+  [20,10,1,9],   // B: x20, y10..18
+  [15,19,20,1],  // C: x15..34, y19
+  [10,19,1,10],  // D: x10, y19..28
+  [25,0,1,10],   // E: x25, y0..9
+  [28,14,10,1],  // F: x28..37, y14
+];
+const LABELS = [
+  ["A", 12, 5.5], ["B", 32, 5.5], ["복도", 8, 15.5], ["C", 5, 24.5], ["D", 30, 24.5],
+];
+const walk = Array.from({length: ROWS}, () => new Array(COLS).fill(true));
+for (const [x, y, w, h] of WALLS)
+  for (let j = y; j < y + h; j++)
+    for (let i = x; i < x + w; i++)
+      if (i >= 0 && j >= 0 && i < COLS && j < ROWS) walk[j][i] = false;
+
+/* ---------------- 상태 ---------------- */
+const S = {
+  mode: "setup-pos", // setup-pos | setup-heading | calibrating | tracking | paused
+  pos: { x: 24.5, y: 24.5 },   // 매칭된 위치 (m)
+  rawPos: { x: 24.5, y: 24.5 },// PDR 원시 위치
+  heading: -Math.PI / 2,       // 라디안. 0 = 지도 위쪽, 시계방향 양
+  steps: 0, dist: 0,
+  trail: [],
+  sim: false,
+  dragging: false,
+};
+const TAU = Math.PI * 2;
+const norm = a => ((a % TAU) + TAU) % TAU;
+const wrapPI = a => { a = norm(a); return a > Math.PI ? a - TAU : a; };
+
+function nearestWalkable(p, r) {
+  r = r || 8;
+  const cx = Math.round(p.x - 0.5), cy = Math.round(p.y - 0.5);
+  let best = null, bd = Infinity;
+  for (let dy = -r; dy <= r; dy++)
+    for (let dx = -r; dx <= r; dx++) {
+      const i = cx + dx, j = cy + dy;
+      if (i < 0 || j < 0 || i >= COLS || j >= ROWS || !walk[j][i]) continue;
+      const px = i + 0.5, py = j + 0.5;
+      const d = (px - p.x) ** 2 + (py - p.y) ** 2;
+      if (d < bd) { bd = d; best = { x: px, y: py }; }
+    }
+  return best;
+}
+function matchToMap(p) {
+  const m = nearestWalkable(p, 3) || nearestWalkable(p, 10);
+  return m || { x: Math.min(Math.max(p.x, 1), COLS - 1), y: Math.min(Math.max(p.y, 1), ROWS - 1) };
+}
+
+/* ---------------- DOM ---------------- */
+const cv = document.getElementById("map");
+const ctx = cv.getContext("2d");
+const banner = document.getElementById("banner");
+const $ = id => document.getElementById(id);
+const btnStart = $("btnStart"), btnPause = $("btnPause"), btnReset = $("btnReset"), btnSim = $("btnSim");
+const chkRaw = $("chkRaw"), chkMag = $("chkMag"), rngStep = $("rngStep");
+
+function setBanner(text, warn) {
+  banner.textContent = text;
+  banner.classList.toggle("warn", !!warn);
+}
+function refreshUI() {
+  const m = S.mode;
+  btnStart.disabled = (m === "tracking" || m === "calibrating");
+  btnStart.textContent = m === "paused" ? "추적 재개" : "추적 시작";
+  btnPause.disabled = (m !== "tracking");
+  btnPause.textContent = m === "paused" ? "계속" : "일시정지";
+  if (m === "setup-pos") setBanner("① 미니맵을 탭/클릭하여 지금 계신 위치를 지정하세요.");
+  else if (m === "setup-heading") setBanner("② 미니맵에서 드래그하여 바라보는 방향(지도 각도)을 지정하세요.");
+  else if (m === "calibrating") setBanner("③ 기기를 평평하게 2초간 고정하세요. (자이로 보정 중)");
+  else if (m === "tracking")
+    setBanner(S.sim ? "추적 중 (시뮬레이션: ↑ 걸음, ← → 회전, ↓ 전향)" : "추적 중 — 화면을 켜둔 채 이동하세요.");
+  else if (m === "paused") setBanner("일시정지됨. (지도 드래그로 방향 재지정 가능)");
+}
+
+/* ---------------- 센서 ---------------- */
+let gyroBias = 0, lastGyroT = null, gyroBuf = [];
+let magHeading = null, magRef = null, headingAtRef = 0;
+let lastGyroEvent = 0, lastAccelEvent = 0;
+let lp = { x: 0, y: 0, z: 0 }, lpInit = false;
+let peak = null, lastStepT = 0;
+let stillSince = null;
+
+function onGyro(rate, t) {
+  lastGyroEvent = performance.now();
+  if (S.mode === "paused") return;
+  if (lastGyroT == null || t < lastGyroT) { lastGyroT = t; return; }
+  let dt = (t - lastGyroT) / 1000;
+  lastGyroT = t;
+  if (dt <= 0 || dt > 0.5) return;
+  if (S.mode === "calibrating") {
+    gyroBuf.push(rate);
+  } else if (S.mode === "tracking" && !S.sim) {
+    S.heading = norm(S.heading + (rate - gyroBias) * dt);
+    if (chkMag.checked && magHeading != null && magRef != null) {
+      const magMap = norm(magHeading - magRef + headingAtRef);
+      S.heading = norm(S.heading + 0.03 * wrapPI(magMap - S.heading));
+    }
+    gyroBuf.push([t, rate]);
+    while (gyroBuf.length && t - gyroBuf[0][0] > 1000) gyroBuf.shift();
+    if (stillSince != null && t - stillSince > 1500 && gyroBuf.length > 20) {
+      let avg = 0;
+      for (const b of gyroBuf) avg += b[1];
+      avg /= gyroBuf.length;
+      gyroBias += 0.1 * (avg - gyroBias);
+    }
+  }
+}
+
+function onAccel(a, t) {
+  lastAccelEvent = performance.now();
+  if (S.mode !== "tracking" || S.sim) { stillSince = null; return; }
+  if (!lpInit) { lp.x = a.x; lp.y = a.y; lp.z = a.z; lpInit = true; return; }
+  lp.x += 0.08 * (a.x - lp.x);
+  lp.y += 0.08 * (a.y - lp.y);
+  lp.z += 0.08 * (a.z - lp.z);
+  const lx = a.x - lp.x, ly = a.y - lp.y, lz = a.z - lp.z;
+  const linMag = Math.hypot(lx, ly, lz);
+  const gMag = Math.hypot(lp.x, lp.y, lp.z);
+  const still = Math.abs(gMag - 9.81) < 0.4 && linMag < 0.55;
+  if (still) { if (stillSince == null) stillSince = t; }
+  else stillSince = null;
+  detectStep(t, linMag);
+}
+
+function detectStep(t, m) {
+  if (m < 0.4 || t - lastStepT < 300) { peak = null; return; }
+  if (peak == null) { peak = m; }
+  else if (m >= peak) { peak = m; }
+  else if (peak > 0.55 && m < 0.35) {
+    lastStepT = t;
+    peak = null;
+    doStep();
+  }
+}
+
+function doStep() {
+  const sl = parseFloat(rngStep.value);
+  S.rawPos.x += sl * Math.sin(S.heading);
+  S.rawPos.y -= sl * Math.cos(S.heading);
+  S.pos = matchToMap(S.rawPos);
+  S.steps++;
+  S.dist += sl;
+  S.trail.push({ x: S.pos.x, y: S.pos.y });
+  if (S.trail.length > 800) S.trail.shift();
+}
+
+if (typeof DeviceMotionEvent !== "undefined") {
+  window.addEventListener("devicemotion", e => {
+    const r = e.rotationRate, a = e.accelerationIncludingGravity;
+    const t = e.timeStamp || performance.now();
+    if (r && r.gamma != null) onGyro(r.gamma * Math.PI / 180, t);
+    if (a && a.x != null) onAccel(a, t);
+  });
+}
+if (typeof DeviceOrientationEvent !== "undefined") {
+  window.addEventListener("deviceorientation", e => {
+    if (e.alpha == null) return;
+    let hDeg;
+    if (e.webkitCompassHeading != null) hDeg = e.webkitCompassHeading;
+    else {
+      const o = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+      hDeg = (360 - e.alpha + o) % 360;
+    }
+    magHeading = hDeg * Math.PI / 180;
+  });
+}
+
+/* ---------------- 흐름 ---------------- */
+async function startTracking() {
+  if (S.mode === "paused") { S.mode = "tracking"; refreshUI(); return; }
+  if (S.mode !== "setup-heading" && S.mode !== "setup-pos") return;
+  S.mode = "calibrating";
+  gyroBuf = [];
+  refreshUI();
+  const needPerms = typeof DeviceMotionEvent !== "undefined" &&
+    typeof DeviceMotionEvent.requestPermission === "function";
+  if (needPerms) {
+    try {
+      const [m, o] = await Promise.all([
+        DeviceMotionEvent.requestPermission(),
+        typeof DeviceOrientationEvent.requestPermission === "function"
+          ? DeviceOrientationEvent.requestPermission()
+          : Promise.resolve("granted"),
+      ]);
+      if (m !== "granted") { setBanner("모션 센서 권한이 거부되었습니다. 시뮬레이션 모드로 테스트할 수 있습니다.", true); S.mode = "setup-heading"; refreshUI(); return; }
+    } catch (err) { setBanner("권한 요청 실패: " + err.message, true); S.mode = "setup-heading"; refreshUI(); return; }
+  }
+  setTimeout(() => {
+    if (S.mode !== "calibrating") return;
+    if (gyroBuf.length > 10) {
+      gyroBias = gyroBuf.reduce((s, v) => s + v, 0) / gyroBuf.length;
+    }
+    if (magHeading != null) { magRef = magHeading; headingAtRef = S.heading; }
+    S.mode = "tracking";
+    refreshUI();
+  }, 2000);
+}
+
+btnStart.onclick = startTracking;
+btnPause.onclick = () => {
+  if (S.mode === "tracking") S.mode = "paused";
+  else if (S.mode === "paused") S.mode = "tracking";
+  refreshUI();
+};
+btnReset.onclick = () => {
+  S.mode = "setup-pos";
+  S.pos = { x: 24.5, y: 24.5 }; S.rawPos = { ...S.pos };
+  S.heading = -Math.PI / 2;
+  S.steps = 0; S.dist = 0; S.trail = [];
+  gyroBias = 0; stillSince = null; lastStepT = 0; peak = null;
+  refreshUI();
+};
+btnSim.onclick = () => {
+  S.sim = !S.sim;
+  btnSim.textContent = S.sim ? "시뮬레이션 (ON)" : "시뮬레이션 모드";
+  if (!S.sim) S.mode = "setup-pos";
+  refreshUI();
+};
+rngStep.oninput = () => { $("rngStepVal").textContent = parseFloat(rngStep.value).toFixed(2); };
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && S.mode === "tracking" && !S.sim) { S.mode = "paused"; refreshUI(); }
+});
+
+/* ---------------- 입력 ---------------- */
+function toMap(e) {
+  const r = cv.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) / r.width * COLS,
+    y: (e.clientY - r.top) / r.height * ROWS,
+  };
+}
+cv.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  cv.setPointerCapture(e.pointerId);
+  const p = toMap(e);
+  if (S.mode === "setup-pos") {
+    const w = nearestWalkable(p, 20);
+    if (w) { S.pos = w; S.rawPos = { ...w }; S.mode = "setup-heading"; refreshUI(); }
+  } else if (S.mode === "setup-heading" || S.mode === "paused") {
+    S.dragging = true;
+    setHeadingFromPoint(p);
+  }
+});
+cv.addEventListener("pointermove", e => {
+  if (S.dragging) setHeadingFromPoint(toMap(e));
+});
+cv.addEventListener("pointerup", () => { S.dragging = false; });
+
+function setHeadingFromPoint(p) {
+  const dx = p.x - S.pos.x, dy = p.y - S.pos.y;
+  if (dx * dx + dy * dy > 0.5) S.heading = Math.atan2(dx, -dy);
+}
+
+window.addEventListener("keydown", e => {
+  if (!S.sim || S.mode !== "tracking") return;
+  const k = e.key;
+  if (k === "ArrowUp" || k === "w" || k === "W") { e.preventDefault(); doStep(); }
+  else if (k === "ArrowLeft" || k === "a" || k === "A") { e.preventDefault(); S.heading = norm(S.heading - 0.12); }
+  else if (k === "ArrowRight" || k === "d" || k === "D") { e.preventDefault(); S.heading = norm(S.heading + 0.12); }
+  else if (k === "ArrowDown" || k === "s" || k === "S") { e.preventDefault(); S.heading = norm(S.heading + Math.PI); }
+});
+
+/* ---------------- 렌더링 ---------------- */
+function draw() {
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const ox = (cv.width - COLS * SCALE) / 2, oy = (cv.height - ROWS * SCALE) / 2;
+  ctx.fillStyle = "#1d242d";
+  ctx.fillRect(ox, oy, COLS * SCALE, ROWS * SCALE);
+  ctx.fillStyle = "#4a5866";
+  for (const [x, y, w, h] of WALLS) ctx.fillRect(ox + x * SCALE, oy + y * SCALE, w * SCALE, h * SCALE);
+  ctx.fillStyle = "#5d6b7a";
+  ctx.font = "14px system-ui";
+  ctx.textAlign = "center";
+  for (const [t, x, y] of LABELS) ctx.fillText(t, ox + x * SCALE, oy + y * SCALE);
+
+  if (S.trail.length > 1) {
+    ctx.strokeStyle = "rgba(126,200,255,0.55)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(ox + S.trail[0].x * SCALE, oy + S.trail[0].y * SCALE);
+    for (const p of S.trail) ctx.lineTo(ox + p.x * SCALE, oy + p.y * SCALE);
+    ctx.stroke();
+  }
+  if (chkRaw.checked && (Math.abs(S.rawPos.x - S.pos.x) > 0.05 || Math.abs(S.rawPos.y - S.pos.y) > 0.05)) {
+    ctx.strokeStyle = "#e08a3c";
+    ctx.lineWidth = 2;
+    const rx = ox + S.rawPos.x * SCALE, ry = oy + S.rawPos.y * SCALE;
+    ctx.beginPath();
+    ctx.moveTo(rx - 6, ry - 6); ctx.lineTo(rx + 6, ry + 6);
+    ctx.moveTo(rx + 6, ry - 6); ctx.lineTo(rx - 6, ry + 6);
+    ctx.stroke();
+  }
+  const ux = ox + S.pos.x * SCALE, uy = oy + S.pos.y * SCALE;
+  ctx.strokeStyle = "#6fd66f";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(ux, uy);
+  ctx.lineTo(ux + 26 * Math.sin(S.heading), uy - 26 * Math.cos(S.heading));
+  ctx.stroke();
+  ctx.fillStyle = "#6fd66f";
+  ctx.beginPath();
+  ctx.arc(ux, uy, 7, 0, TAU);
+  ctx.fill();
+
+  const now = performance.now();
+  const gEl = $("stGyro"), aEl = $("stAccel");
+  const gOK = now - lastGyroEvent < 1500, aOK = now - lastAccelEvent < 1500;
+  gEl.textContent = "자이로: " + (gOK ? "ON" : "없음");
+  gEl.className = gOK ? "ok" : "bad";
+  aEl.textContent = "가속도: " + (aOK ? "ON" : "없음");
+  aEl.className = aOK ? "ok" : "bad";
+  $("stHeading").textContent = Math.round(norm(S.heading) * 180 / Math.PI) + "°";
+  $("stSteps").textContent = S.steps;
+  $("stDist").textContent = S.dist.toFixed(1);
+
+  requestAnimationFrame(draw);
+}
+refreshUI();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
