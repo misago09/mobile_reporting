@@ -174,10 +174,10 @@ let gyroBias = 0, lastGyroT = null, gyroBuf = [];
 let magHeading = null, magRef = null, headingAtRef = 0;
 let lastGyroEvent = 0, lastAccelEvent = 0;
 let lp = { x: 0, y: 0, z: 0 }, lpInit = false;
-let stepState = 0, peak = 0, lastStepWall = 0, stepStuckSince = 0, linMag = 0, stepFlash = 0;
+let lastStepWall = 0, linMag = 0, stepFlash = 0;
 let stillSince = null, lastEventT = 0;
-let lastVr = 0, peakVr = 0;
-const TRIG = 0.4, FIRE = 0.6, REC = 0.2, VMIN = 0.5; // VMIN = 수직 성분 최소 비율
+let lastVr = 0, lastVAcc = 0, vArmed = true;
+const VHI = 0.55, VLO = -0.1, MIN_INT = 350, VMIN = 0.5; // VHI=수직피크, VLO=골(재장전), MIN_INT=최소걸음간격, VMIN=수직최소비율
 const diag = { ev: 0, tsBad: 0, steps: 0, nan: 0, ring: [] };
 let logBuf = [], lastLogT = 0, stepSinceLog = false;
 let stepEvents = []; // 걸음 감지 이벤트 상세 (t, peak, vr, head)
@@ -221,51 +221,47 @@ function onAccel(a) {
   lp.y += 0.08 * (a.y - lp.y);
   lp.z += 0.08 * (a.z - lp.z);
   const lx = a.x - lp.x, ly = a.y - lp.y, lz = a.z - lp.z;
-  const linMag = Math.hypot(lx, ly, lz);
+  const m = Math.hypot(lx, ly, lz);
   const gMag = Math.hypot(lp.x, lp.y, lp.z) || 1;
-  // 중력 축(수직) 방향 선가속도 성분과, 전체 선가속도에서 수직이 차지하는 비율
+  // 중력 축(수직) 방향 선가속도 성분(부호 포함)과, 전체 선가속도에서 수직이 차지하는 비율
   const vAcc = (lx * lp.x + ly * lp.y + lz * lp.z) / gMag;
-  const vr = linMag > 1e-4 ? Math.min(1, Math.abs(vAcc) / linMag) : 0;
-  lastVr = vr;
-  const still = Math.abs(gMag - 9.81) < 0.4 && linMag < 0.55;
+  const vr = m > 1e-4 ? Math.min(1, Math.abs(vAcc) / m) : 0;
+  linMag = m; lastVr = vr; lastVAcc = vAcc;
+  const still = Math.abs(gMag - 9.81) < 0.4 && m < 0.55;
   if (still) { if (stillSince == null) stillSince = t; }
   else stillSince = null;
   diag.ev++;
   if (lastEventT > 0 && t < lastEventT) diag.tsBad++;
   lastEventT = t;
-  diag.ring.push([t, linMag]);
+  diag.ring.push([t, m]);
   while (diag.ring.length && t - diag.ring[0][0] > 10000) diag.ring.shift();
-  const stepped = detectStep(t, linMag, vr);
+  const stepped = detectStep(t, vAcc, vr);
   if (stepped) stepSinceLog = true;
   if (t - lastLogT >= 100) {
     lastLogT = t;
-    logBuf.push([t, a.x, a.y, a.z, linMag, vAcc, vr,
+    logBuf.push([t, a.x, a.y, a.z, m, vAcc, vr,
       Math.round(norm(S.heading) * 180 / Math.PI), S.pos.x, S.pos.y, stepSinceLog ? 1 : 0]);
     stepSinceLog = false;
     if (logBuf.length > 3000) logBuf.shift();
   }
 }
 
-function detectStep(t, m, vr) {
-  linMag = m;
-  if (t - lastStepWall < 300) { stepState = 0; return false; }
-  if (stepState === 0) {
-    if (m > TRIG) { stepState = 1; peak = m; peakVr = vr; stepStuckSince = t; }
-    return false;
-  }
-  if (m > peak) peak = m;
-  if (vr > peakVr) peakVr = vr;
-  if (t - stepStuckSince > 2000) { stepState = 0; return false; }
-  if (m < REC && peak > FIRE && peakVr >= VMIN) {
-    stepState = 0;
-    lastStepWall = t;
-    diag.steps++;
-    stepEvents.push({ t: Math.round(t), peak: peak.toFixed(2), vr: peakVr.toFixed(2),
-      head: Math.round(norm(S.heading) * 180 / Math.PI) });
-    if (stepEvents.length > 200) stepEvents.shift();
-    doStep();
-    stepFlash = t;
-    return true;
+// 수직 가속도(vAcc)의 양(+) 피크를 걸음으로 간주.
+// 골(vAcc<VLO)을 지나야 재장전(vArmed)되어 1 진동 = 1 걸음. 가로 흔들림은 vr 게이트로 거부.
+function detectStep(t, vAcc, vr) {
+  if (vr >= VMIN) {
+    if (vAcc < VLO) vArmed = true;
+    else if (vArmed && vAcc > VHI && t - lastStepWall >= MIN_INT) {
+      lastStepWall = t;
+      vArmed = false;
+      diag.steps++;
+      stepEvents.push({ t: Math.round(t), peak: vAcc.toFixed(2), vr: vr.toFixed(2),
+        head: Math.round(norm(S.heading) * 180 / Math.PI) });
+      if (stepEvents.length > 200) stepEvents.shift();
+      doStep();
+      stepFlash = t;
+      return true;
+    }
   }
   return false;
 }
@@ -291,13 +287,13 @@ if (typeof DeviceMotionEvent !== "undefined") {
 if (typeof DeviceOrientationEvent !== "undefined") {
   window.addEventListener("deviceorientation", e => {
     if (e.alpha == null) return;
-    let hDeg;
-    if (e.webkitCompassHeading != null) hDeg = e.webkitCompassHeading;
-    else {
+    let hDeg = NaN;
+    if (e.webkitCompassHeading != null && !isNaN(e.webkitCompassHeading)) hDeg = e.webkitCompassHeading;
+    else if (e.alpha != null && !isNaN(e.alpha)) {
       const o = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
       hDeg = (360 - e.alpha + o) % 360;
     }
-    if (typeof hDeg !== "number" || isNaN(hDeg)) { diag.nan++; return; }
+    if (isNaN(hDeg)) { diag.nan++; return; }
     magHeading = hDeg * Math.PI / 180;
   });
 }
@@ -344,8 +340,8 @@ btnReset.onclick = () => {
   S.pos = { x: 24.5, y: 24.5 }; S.rawPos = { ...S.pos };
   S.heading = -Math.PI / 2;
   S.steps = 0; S.dist = 0; S.trail = [];
-  gyroBias = 0; stillSince = null; lastStepWall = 0; stepStuckSince = 0; stepState = 0; peak = 0; linMag = 0; lastEventT = 0;
-  lastVr = 0; peakVr = 0; logBuf.length = 0; lastLogT = 0; stepSinceLog = false;
+  gyroBias = 0; stillSince = null; lastStepWall = 0; linMag = 0; lastEventT = 0;
+  lastVr = 0; lastVAcc = 0; vArmed = true; logBuf.length = 0; lastLogT = 0; stepSinceLog = false;
   stepEvents.length = 0;
   diag.ev = 0; diag.tsBad = 0; diag.steps = 0; diag.nan = 0; diag.ring.length = 0;
   $("logBox").style.display = "none";
@@ -513,7 +509,7 @@ function draw() {
     $("diagText").textContent =
       "이벤트: " + diag.ev + " | 최근 5초: " + (c / 5).toFixed(0) + "/s | m 최대(10초): " + maxM.toFixed(2) +
       " | NaN: " + diag.nan +
-       " | 걸음 감지: " + diag.steps + " | 감지 상태: " + stepState + " (피크 " + peak.toFixed(2) + " / 수직비율 " + lastVr.toFixed(2) + ")" +
+        " | 걸음 감지: " + diag.steps + " | vAcc: " + lastVAcc.toFixed(2) + " (vr " + lastVr.toFixed(2) + ", armed " + (vArmed ? 1 : 0) + ")" +
       " | rawPos: (" + S.rawPos.x.toFixed(1) + ", " + S.rawPos.y.toFixed(1) + ") → pos: (" + S.pos.x.toFixed(1) + ", " + S.pos.y.toFixed(1) + ")" +
       " | 줌: " + view.zoom.toFixed(1) + "x";
   }
