@@ -59,12 +59,21 @@
   <span id="stGyro" class="bad">자이로: 없음</span>
   <span id="stAccel" class="bad">가속도: 없음</span>
 </div>
+<details>
+  <summary>진단 (센서 데이터 확인)</summary>
+  <div id="diagText" style="font-size:12px;margin:6px 0;line-height:1.6">-</div>
+  <button id="btnDiagReset" class="secondary" type="button">진단 카운터 리셋</button>
+</details>
 <div id="controls">
   <button id="btnStart">추적 시작</button>
   <button id="btnPause" class="secondary" disabled>일시정지</button>
   <button id="btnReset" class="secondary">처음부터</button>
   <button id="btnSim" class="secondary">시뮬레이션 모드</button>
   <button id="btnTestStep" class="secondary">걸음 1회(테스트)</button>
+  <button id="btnZoomOut" class="secondary">－</button>
+  <button id="btnZoomIn" class="secondary">＋</button>
+  <button id="btnFollow" class="secondary">내위치</button>
+  <span class="slider">줌 <b id="zoomLabel">1.0</b>x</span>
   <label class="chk"><input type="checkbox" id="chkRaw"> 원시 위치 보기</label>
   <label class="chk"><input type="checkbox" id="chkMag" checked> 자계 보정</label>
   <span class="slider">걸음 길이 <input type="range" id="rngStep" min="0.4" max="0.9" step="0.05" value="0.7"><span id="rngStepVal">0.70</span> m</span>
@@ -108,6 +117,7 @@ const S = {
   sim: false,
   dragging: false,
 };
+const view = { zoom: 1, offX: 0, offY: 0, ox: 0, oy: 0, s: SCALE };
 const TAU = Math.PI * 2;
 const norm = a => ((a % TAU) + TAU) % TAU;
 const wrapPI = a => { a = norm(a); return a > Math.PI ? a - TAU : a; };
@@ -162,11 +172,13 @@ let gyroBias = 0, lastGyroT = null, gyroBuf = [];
 let magHeading = null, magRef = null, headingAtRef = 0;
 let lastGyroEvent = 0, lastAccelEvent = 0;
 let lp = { x: 0, y: 0, z: 0 }, lpInit = false;
-let stepState = 0, peak = 0, lastStepT = 0, linMag = 0, stepFlash = 0;
-let stillSince = null;
+let stepState = 0, peak = 0, lastStepWall = 0, stepStuckSince = 0, linMag = 0, stepFlash = 0;
+let stillSince = null, lastEventT = 0;
+const diag = { ev: 0, tsBad: 0, steps: 0, ring: [] };
 
-function onGyro(rate, t) {
-  lastGyroEvent = performance.now();
+function onGyro(rate) {
+  const t = performance.now();
+  lastGyroEvent = t;
   if (S.mode === "paused") return;
   if (lastGyroT == null || t < lastGyroT) { lastGyroT = t; return; }
   let dt = (t - lastGyroT) / 1000;
@@ -191,8 +203,9 @@ function onGyro(rate, t) {
   }
 }
 
-function onAccel(a, t) {
-  lastAccelEvent = performance.now();
+function onAccel(a) {
+  const t = performance.now();
+  lastAccelEvent = t;
   if (S.mode !== "tracking" || S.sim) { stillSince = null; return; }
   if (!lpInit) { lp.x = a.x; lp.y = a.y; lp.z = a.z; lpInit = true; return; }
   lp.x += 0.08 * (a.x - lp.x);
@@ -204,21 +217,28 @@ function onAccel(a, t) {
   const still = Math.abs(gMag - 9.81) < 0.4 && linMag < 0.55;
   if (still) { if (stillSince == null) stillSince = t; }
   else stillSince = null;
+  diag.ev++;
+  if (lastEventT > 0 && t < lastEventT) diag.tsBad++;
+  lastEventT = t;
+  diag.ring.push([t, linMag]);
+  while (diag.ring.length && t - diag.ring[0][0] > 10000) diag.ring.shift();
   detectStep(t, linMag);
 }
 
 function detectStep(t, m) {
   linMag = m;
-  if (t - lastStepT < 300) { stepState = 0; return; }
+  if (t - lastStepWall < 300) { stepState = 0; return; }
   if (stepState === 0) {
-    if (m > 0.45) { stepState = 1; peak = m; }
+    if (m > 0.35) { stepState = 1; peak = m; stepStuckSince = t; }
   } else {
     if (m > peak) peak = m;
-    if (m < 0.25 && peak > 0.55) {
+    if (t - stepStuckSince > 2000) { stepState = 0; return; }
+    if (m < 0.2 && peak > 0.45) {
       stepState = 0;
-      lastStepT = t;
+      lastStepWall = t;
+      diag.steps++;
       doStep();
-      stepFlash = performance.now();
+      stepFlash = t;
     }
   }
 }
@@ -237,9 +257,8 @@ function doStep() {
 if (typeof DeviceMotionEvent !== "undefined") {
   window.addEventListener("devicemotion", e => {
     const r = e.rotationRate, a = e.accelerationIncludingGravity;
-    const t = e.timeStamp || performance.now();
-    if (r && r.gamma != null) onGyro(r.gamma * Math.PI / 180, t);
-    if (a && a.x != null) onAccel(a, t);
+    if (r && r.gamma != null) onGyro(r.gamma * Math.PI / 180);
+    if (a && a.x != null) onAccel(a);
   });
 }
 if (typeof DeviceOrientationEvent !== "undefined") {
@@ -297,7 +316,8 @@ btnReset.onclick = () => {
   S.pos = { x: 24.5, y: 24.5 }; S.rawPos = { ...S.pos };
   S.heading = -Math.PI / 2;
   S.steps = 0; S.dist = 0; S.trail = [];
-  gyroBias = 0; stillSince = null; lastStepT = 0; stepState = 0; peak = 0; linMag = 0;
+  gyroBias = 0; stillSince = null; lastStepWall = 0; stepStuckSince = 0; stepState = 0; peak = 0; linMag = 0; lastEventT = 0;
+  diag.ev = 0; diag.tsBad = 0; diag.steps = 0; diag.ring.length = 0;
   refreshUI();
 };
 btnSim.onclick = () => {
@@ -308,19 +328,24 @@ btnSim.onclick = () => {
 };
 rngStep.oninput = () => { $("rngStepVal").textContent = parseFloat(rngStep.value).toFixed(2); };
 $("btnTestStep").onclick = () => { if (S.mode === "tracking" || S.mode === "paused") doStep(); };
+$("btnZoomIn").onclick = () => { view.zoom = Math.min(3, view.zoom + 0.5); $("zoomLabel").textContent = view.zoom.toFixed(1); };
+$("btnZoomOut").onclick = () => { view.zoom = Math.max(1, view.zoom - 0.5); $("zoomLabel").textContent = view.zoom.toFixed(1); };
+$("btnFollow").onclick = () => { view.offX = S.pos.x - COLS / 2; view.offY = S.pos.y - ROWS / 2; };
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden && S.mode === "tracking" && !S.sim) { S.mode = "paused"; refreshUI(); }
 });
 
 /* ---------------- 입력 ---------------- */
-function toMap(e) {
+function canvasPoint(e) {
   const r = cv.getBoundingClientRect();
-  return {
-    x: (e.clientX - r.left) / r.width * COLS,
-    y: (e.clientY - r.top) / r.height * ROWS,
-  };
+  return { x: (e.clientX - r.left) * (cv.width / r.width), y: (e.clientY - r.top) * (cv.height / r.height) };
 }
+function toMap(e) {
+  const p = canvasPoint(e);
+  return { x: (p.x - view.ox) / view.s, y: (p.y - view.oy) / view.s };
+}
+let panLast = null;
 cv.addEventListener("pointerdown", e => {
   e.preventDefault();
   cv.setPointerCapture(e.pointerId);
@@ -331,12 +356,20 @@ cv.addEventListener("pointerdown", e => {
   } else if (S.mode === "setup-heading" || S.mode === "paused") {
     S.dragging = true;
     setHeadingFromPoint(p);
+  } else if (S.mode === "tracking" && view.zoom > 1) {
+    panLast = canvasPoint(e);
   }
 });
 cv.addEventListener("pointermove", e => {
-  if (S.dragging) setHeadingFromPoint(toMap(e));
+  if (S.dragging) { setHeadingFromPoint(toMap(e)); return; }
+  if (panLast && S.mode === "tracking") {
+    const p = canvasPoint(e);
+    view.offX -= (p.x - panLast.x) / view.s;
+    view.offY -= (p.y - panLast.y) / view.s;
+    panLast = p;
+  }
 });
-cv.addEventListener("pointerup", () => { S.dragging = false; });
+cv.addEventListener("pointerup", () => { S.dragging = false; panLast = null; });
 
 function setHeadingFromPoint(p) {
   const dx = p.x - S.pos.x, dy = p.y - S.pos.y;
@@ -355,34 +388,40 @@ window.addEventListener("keydown", e => {
 /* ---------------- 렌더링 ---------------- */
 function draw() {
   ctx.clearRect(0, 0, cv.width, cv.height);
-  const ox = (cv.width - COLS * SCALE) / 2, oy = (cv.height - ROWS * SCALE) / 2;
+  const s = (view.s = SCALE * view.zoom);
+  const halfViewW = (cv.width / 2) / s, halfViewH = (cv.height / 2) / s;
+  const maxOffX = Math.max(0, COLS / 2 - halfViewW), maxOffY = Math.max(0, ROWS / 2 - halfViewH);
+  view.offX = Math.max(-maxOffX, Math.min(maxOffX, view.offX));
+  view.offY = Math.max(-maxOffY, Math.min(maxOffY, view.offY));
+  const ox = (view.ox = cv.width / 2 - (COLS / 2 + view.offX) * s);
+  const oy = (view.oy = cv.height / 2 - (ROWS / 2 + view.offY) * s);
   ctx.fillStyle = "#1d242d";
-  ctx.fillRect(ox, oy, COLS * SCALE, ROWS * SCALE);
+  ctx.fillRect(ox, oy, COLS * s, ROWS * s);
   ctx.fillStyle = "#4a5866";
-  for (const [x, y, w, h] of WALLS) ctx.fillRect(ox + x * SCALE, oy + y * SCALE, w * SCALE, h * SCALE);
+  for (const [x, y, w, h] of WALLS) ctx.fillRect(ox + x * s, oy + y * s, w * s, h * s);
   ctx.fillStyle = "#5d6b7a";
   ctx.font = "14px system-ui";
   ctx.textAlign = "center";
-  for (const [t, x, y] of LABELS) ctx.fillText(t, ox + x * SCALE, oy + y * SCALE);
+  for (const [t, x, y] of LABELS) ctx.fillText(t, ox + x * s, oy + y * s);
 
   if (S.trail.length > 1) {
     ctx.strokeStyle = "rgba(126,200,255,0.55)";
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(ox + S.trail[0].x * SCALE, oy + S.trail[0].y * SCALE);
-    for (const p of S.trail) ctx.lineTo(ox + p.x * SCALE, oy + p.y * SCALE);
+    ctx.moveTo(ox + S.trail[0].x * s, oy + S.trail[0].y * s);
+    for (const p of S.trail) ctx.lineTo(ox + p.x * s, oy + p.y * s);
     ctx.stroke();
   }
   if (chkRaw.checked && (Math.abs(S.rawPos.x - S.pos.x) > 0.05 || Math.abs(S.rawPos.y - S.pos.y) > 0.05)) {
     ctx.strokeStyle = "#e08a3c";
     ctx.lineWidth = 2;
-    const rx = ox + S.rawPos.x * SCALE, ry = oy + S.rawPos.y * SCALE;
+    const rx = ox + S.rawPos.x * s, ry = oy + S.rawPos.y * s;
     ctx.beginPath();
     ctx.moveTo(rx - 6, ry - 6); ctx.lineTo(rx + 6, ry + 6);
     ctx.moveTo(rx + 6, ry - 6); ctx.lineTo(rx - 6, ry + 6);
     ctx.stroke();
   }
-  const ux = ox + S.pos.x * SCALE, uy = oy + S.pos.y * SCALE;
+  const ux = ox + S.pos.x * s, uy = oy + S.pos.y * s;
   ctx.strokeStyle = "#6fd66f";
   ctx.lineWidth = 3;
   ctx.beginPath();
@@ -405,6 +444,18 @@ function draw() {
   $("stSteps").textContent = S.steps;
   $("stDist").textContent = S.dist.toFixed(1);
   $("stLin").textContent = linMag.toFixed(2);
+  {
+    const nowD = performance.now();
+    let c = 0;
+    for (let i = diag.ring.length - 1; i >= 0 && nowD - diag.ring[i][0] < 5000; i--) c++;
+    let maxM = 0;
+    for (const q of diag.ring) if (q[1] > maxM) maxM = q[1];
+    $("diagText").textContent =
+      "이벤트: " + diag.ev + " | 최근 5초: " + (c / 5).toFixed(0) + "/s | m 최대(10초): " + maxM.toFixed(2) +
+      " | 걸음 감지: " + diag.steps + " | 감지 상태: " + stepState + " (피크 " + peak.toFixed(2) + ")" +
+      " | rawPos: (" + S.rawPos.x.toFixed(1) + ", " + S.rawPos.y.toFixed(1) + ") → pos: (" + S.pos.x.toFixed(1) + ", " + S.pos.y.toFixed(1) + ")" +
+      " | 줌: " + view.zoom.toFixed(1) + "x";
+  }
 
   if (performance.now() - stepFlash < 350) {
     const pr = (performance.now() - stepFlash) / 350;
