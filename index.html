@@ -70,6 +70,7 @@
   <button id="btnReset" class="secondary">처음부터</button>
   <button id="btnSim" class="secondary">시뮬레이션 모드</button>
   <button id="btnTestStep" class="secondary">걸음 1회(테스트)</button>
+  <button id="btnLog" class="secondary">로그 10초 복사</button>
   <button id="btnZoomOut" class="secondary">－</button>
   <button id="btnZoomIn" class="secondary">＋</button>
   <button id="btnFollow" class="secondary">내위치</button>
@@ -78,6 +79,7 @@
   <label class="chk"><input type="checkbox" id="chkMag" checked> 자계 보정</label>
   <span class="slider">걸음 길이 <input type="range" id="rngStep" min="0.4" max="0.9" step="0.05" value="0.7"><span id="rngStepVal">0.70</span> m</span>
 </div>
+<textarea id="logBox" readonly style="display:none;width:100%;max-width:700px;height:170px;font-size:11px;margin-top:8px;background:#0d1116;color:#9fb3c8;border:1px solid #2c3e50;border-radius:8px;font-family:monospace;white-space:pre"></textarea>
 <div id="hint">
   사용: ① 위치 지정(지도 탭) → ② 방향 지정(지도 드래그) → ③ 추적 시작.<br>
   실제 센서는 HTTPS 또는 localhost 환경에서만 동작합니다. 데스크톱에서 테스트하려면 시뮬레이션 모드를 켜고
@@ -174,7 +176,10 @@ let lastGyroEvent = 0, lastAccelEvent = 0;
 let lp = { x: 0, y: 0, z: 0 }, lpInit = false;
 let stepState = 0, peak = 0, lastStepWall = 0, stepStuckSince = 0, linMag = 0, stepFlash = 0;
 let stillSince = null, lastEventT = 0;
+let lastVr = 0, peakVr = 0;
+const TRIG = 0.35, FIRE = 0.45, REC = 0.2, VMIN = 0.5; // VMIN = 수직 성분 최소 비율
 const diag = { ev: 0, tsBad: 0, steps: 0, ring: [] };
+let logBuf = [], lastLogT = 0, stepSinceLog = false;
 
 function onGyro(rate) {
   const t = performance.now();
@@ -213,7 +218,11 @@ function onAccel(a) {
   lp.z += 0.08 * (a.z - lp.z);
   const lx = a.x - lp.x, ly = a.y - lp.y, lz = a.z - lp.z;
   const linMag = Math.hypot(lx, ly, lz);
-  const gMag = Math.hypot(lp.x, lp.y, lp.z);
+  const gMag = Math.hypot(lp.x, lp.y, lp.z) || 1;
+  // 중력 축(수직) 방향 선가속도 성분과, 전체 선가속도에서 수직이 차지하는 비율
+  const vAcc = (lx * lp.x + ly * lp.y + lz * lp.z) / gMag;
+  const vr = linMag > 1e-4 ? Math.min(1, Math.abs(vAcc) / linMag) : 0;
+  lastVr = vr;
   const still = Math.abs(gMag - 9.81) < 0.4 && linMag < 0.55;
   if (still) { if (stillSince == null) stillSince = t; }
   else stillSince = null;
@@ -222,25 +231,36 @@ function onAccel(a) {
   lastEventT = t;
   diag.ring.push([t, linMag]);
   while (diag.ring.length && t - diag.ring[0][0] > 10000) diag.ring.shift();
-  detectStep(t, linMag);
+  const stepped = detectStep(t, linMag, vr);
+  if (stepped) stepSinceLog = true;
+  if (t - lastLogT >= 100) {
+    lastLogT = t;
+    logBuf.push([t, a.x, a.y, a.z, linMag, vAcc, vr,
+      Math.round(norm(S.heading) * 180 / Math.PI), S.pos.x, S.pos.y, stepSinceLog ? 1 : 0]);
+    stepSinceLog = false;
+    if (logBuf.length > 3000) logBuf.shift();
+  }
 }
 
-function detectStep(t, m) {
+function detectStep(t, m, vr) {
   linMag = m;
-  if (t - lastStepWall < 300) { stepState = 0; return; }
+  if (t - lastStepWall < 300) { stepState = 0; return false; }
   if (stepState === 0) {
-    if (m > 0.35) { stepState = 1; peak = m; stepStuckSince = t; }
-  } else {
-    if (m > peak) peak = m;
-    if (t - stepStuckSince > 2000) { stepState = 0; return; }
-    if (m < 0.2 && peak > 0.45) {
-      stepState = 0;
-      lastStepWall = t;
-      diag.steps++;
-      doStep();
-      stepFlash = t;
-    }
+    if (m > TRIG) { stepState = 1; peak = m; peakVr = vr; stepStuckSince = t; }
+    return false;
   }
+  if (m > peak) peak = m;
+  if (vr > peakVr) peakVr = vr;
+  if (t - stepStuckSince > 2000) { stepState = 0; return false; }
+  if (m < REC && peak > FIRE && peakVr >= VMIN) {
+    stepState = 0;
+    lastStepWall = t;
+    diag.steps++;
+    doStep();
+    stepFlash = t;
+    return true;
+  }
+  return false;
 }
 
 function doStep() {
@@ -317,7 +337,9 @@ btnReset.onclick = () => {
   S.heading = -Math.PI / 2;
   S.steps = 0; S.dist = 0; S.trail = [];
   gyroBias = 0; stillSince = null; lastStepWall = 0; stepStuckSince = 0; stepState = 0; peak = 0; linMag = 0; lastEventT = 0;
+  lastVr = 0; peakVr = 0; logBuf.length = 0; lastLogT = 0; stepSinceLog = false;
   diag.ev = 0; diag.tsBad = 0; diag.steps = 0; diag.ring.length = 0;
+  $("logBox").style.display = "none";
   refreshUI();
 };
 btnSim.onclick = () => {
@@ -328,6 +350,29 @@ btnSim.onclick = () => {
 };
 rngStep.oninput = () => { $("rngStepVal").textContent = parseFloat(rngStep.value).toFixed(2); };
 $("btnTestStep").onclick = () => { if (S.mode === "tracking" || S.mode === "paused") doStep(); };
+$("btnLog").onclick = async () => {
+  const now = performance.now(), start = now - 10000;
+  const rows = logBuf.filter(r => r[0] >= start);
+  $("logBox").style.display = "block";
+  if (!rows.length) {
+    $("logBox").value = "로그 없음 — 추적 모드에서 센서가 오면 100ms 간격으로 쌓입니다.";
+    setBanner("최근 10초 로그가 없습니다. 추적 중인지 확인하세요.", true);
+    return;
+  }
+  const lines = rows.map(r => [
+    (r[0] - start).toFixed(0), r[1].toFixed(1), r[2].toFixed(1), r[3].toFixed(1),
+    r[4].toFixed(2), r[5].toFixed(2), r[6].toFixed(2), String(r[7]).padStart(4),
+    r[8].toFixed(1), r[9].toFixed(1), r[10]
+  ].join(" "));
+  const text = "t(ms)  ax  ay  az   lin  vAcc  vr  head   x    y   S\n" + lines.join("\n");
+  $("logBox").value = text;
+  try {
+    await navigator.clipboard.writeText(text);
+    setBanner("로그 " + rows.length + "개를 클립보드에 복사했습니다. 채팅에 붙여넣어 주세요. (S=1 이 줄에서 걸음 감지)", false);
+  } catch (e) {
+    setBanner("클립보드 복사에 실패했습니다. 아래 로그 상자를 길게 눌러 복사하세요.", true);
+  }
+};
 $("btnZoomIn").onclick = () => { view.zoom = Math.min(3, view.zoom + 0.5); $("zoomLabel").textContent = view.zoom.toFixed(1); };
 $("btnZoomOut").onclick = () => { view.zoom = Math.max(1, view.zoom - 0.5); $("zoomLabel").textContent = view.zoom.toFixed(1); };
 $("btnFollow").onclick = () => { view.offX = S.pos.x - COLS / 2; view.offY = S.pos.y - ROWS / 2; };
@@ -452,7 +497,7 @@ function draw() {
     for (const q of diag.ring) if (q[1] > maxM) maxM = q[1];
     $("diagText").textContent =
       "이벤트: " + diag.ev + " | 최근 5초: " + (c / 5).toFixed(0) + "/s | m 최대(10초): " + maxM.toFixed(2) +
-      " | 걸음 감지: " + diag.steps + " | 감지 상태: " + stepState + " (피크 " + peak.toFixed(2) + ")" +
+       " | 걸음 감지: " + diag.steps + " | 감지 상태: " + stepState + " (피크 " + peak.toFixed(2) + " / 수직비율 " + lastVr.toFixed(2) + ")" +
       " | rawPos: (" + S.rawPos.x.toFixed(1) + ", " + S.rawPos.y.toFixed(1) + ") → pos: (" + S.pos.x.toFixed(1) + ", " + S.pos.y.toFixed(1) + ")" +
       " | 줌: " + view.zoom.toFixed(1) + "x";
   }
